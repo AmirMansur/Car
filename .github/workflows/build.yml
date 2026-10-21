@@ -1,1 +1,601 @@
+name: Build APK
 
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.24.5
+          channel: stable
+          cache: true
+
+      - name: Create app and write code
+        run: |
+          flutter create --org com.fleet --project-name car_rental --platforms android app
+          rm -rf app/test
+          cat > app/lib/main.dart <<'DARTEOF'
+          import 'dart:convert';
+          import 'dart:io';
+          import 'dart:typed_data';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/material.dart';
+          import 'package:image_picker/image_picker.dart';
+          import 'package:path_provider/path_provider.dart';
+          import 'package:share_plus/share_plus.dart';
+
+          typedef M = Map<String, dynamic>;
+          const kNavy = Color(0xFF0F2A4A), kBlue = Color(0xFF1A73E8), kGreen = Color(0xFF12A150), kRed = Color(0xFFE5484D), kAmber = Color(0xFFE8A317);
+
+          M emptyDb() => {'cars': [], 'drivers': [], 'trips': [], 'expenses': [], 'maint': [], 'pin': ''};
+          M S = emptyDb();
+          late File _dbFile;
+
+          Future<void> loadDb() async {
+            final d = await getApplicationDocumentsDirectory();
+            _dbFile = File('${d.path}/fleet.json');
+            if (await _dbFile.exists()) {
+              try { S = {...emptyDb(), ...(jsonDecode(await _dbFile.readAsString()) as M)}; } catch (_) {}
+            }
+          }
+          Future<void> saveDb() => _dbFile.writeAsString(jsonEncode(S));
+
+          // ---------- helpers ----------
+          List L(String k) => S[k] as List;
+          M find(String k, dynamic id) => L(k).firstWhere((x) => x['id'] == id, orElse: () => <String, dynamic>{}) as M;
+          num nn(dynamic v) => v is num ? v : (num.tryParse('${v ?? ''}') ?? 0);
+          String today() => DateTime.now().toIso8601String().substring(0, 10);
+          String uid() => DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+          num dist(M t) { final d = nn(t['endKm']) - nn(t['startKm']); return d > 0 ? d : 0; }
+          num inc(M t) => nn(t['charge']) + nn(t['extra']);
+          String money(dynamic v) {
+            final n = nn(v).round();
+            var s = n.abs().toString();
+            if (s.length > 3) {
+              final last = s.substring(s.length - 3);
+              final rest = s.substring(0, s.length - 3).replaceAllMapped(RegExp(r'(\d)(?=(\d\d)+$)'), (m) => '${m[1]},');
+              s = '$rest,$last';
+            }
+            return '${n < 0 ? '-' : ''}₹$s';
+          }
+          Map<String, num> stats(String m, [dynamic cid]) {
+            num i = 0, e = 0, k = 0;
+            for (final t in L('trips')) {
+              if ('${t['date']}'.startsWith(m) && (cid == null || t['carId'] == cid)) { i += inc(t); e += nn(t['costs']); k += dist(t); }
+            }
+            for (final x in L('expenses')) {
+              if ('${x['date']}'.startsWith(m) && (cid == null || x['carId'] == cid)) e += nn(x['amount']);
+            }
+            return {'i': i, 'e': e, 'k': k};
+          }
+          List<M> rem() {
+            final r = <M>[];
+            for (final c in L('cars')) {
+              for (final p in [['insurance', 'Insurance expiry'], ['puc', 'PUC expiry'], ['permit', 'Permit expiry']]) {
+                if ('${c[p[0]] ?? ''}'.isNotEmpty) r.add({'t': p[1], 'c': c['reg'], 'd': c[p[0]]});
+              }
+            }
+            for (final m in L('maint')) {
+              if (m['done'] != 'Yes') r.add({'t': m['title'], 'c': find('cars', m['carId'])['reg'], 'd': m['dueDate'], 'k': m['dueKm']});
+            }
+            r.sort((a, b) => '${a['d'] ?? ''}'.isEmpty ? 1 : '${b['d'] ?? ''}'.isEmpty ? -1 : '${a['d']}'.compareTo('${b['d']}'));
+            return r;
+          }
+
+          // ---------- small widgets ----------
+          Widget card(Widget child, {VoidCallback? onTap}) => Card(
+              margin: const EdgeInsets.only(bottom: 10),
+              child: InkWell(onTap: onTap, borderRadius: BorderRadius.circular(12), child: Padding(padding: const EdgeInsets.all(12), child: child)));
+          Widget badge(String t, Color c) => Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(color: c, borderRadius: BorderRadius.circular(10)),
+              child: Text(t, style: const TextStyle(color: Colors.white, fontSize: 11)));
+          Widget dueBadge(dynamic d) {
+            final dt = DateTime.tryParse('${d ?? ''}');
+            if (dt == null) return const SizedBox();
+            final n = dt.difference(DateTime.parse(today())).inDays;
+            return n < 0 ? badge('Overdue', kRed) : n <= 30 ? badge('Due in ${n}d', kAmber) : badge('$d', kGreen);
+          }
+          Widget bar(String l, num v, num mx, Color c) => Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(children: [
+                SizedBox(width: 64, child: Text(l, style: const TextStyle(fontSize: 13))),
+                Expanded(child: ClipRRect(borderRadius: BorderRadius.circular(5), child: LinearProgressIndicator(value: mx > 0 ? (v / mx).clamp(0, 1).toDouble() : 0, minHeight: 10, color: c, backgroundColor: const Color(0xFFE8EDF3)))),
+                SizedBox(width: 88, child: Text(money(v), textAlign: TextAlign.right, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13))),
+              ]));
+          Widget kv(String k, dynamic v) => Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                Text(k, style: const TextStyle(color: Colors.grey)),
+                const SizedBox(width: 12),
+                Flexible(child: Text('${v ?? ''}', textAlign: TextAlign.right, style: const TextStyle(fontWeight: FontWeight.w600))),
+              ]));
+          final Map<String, Uint8List> _ic = {};
+          Widget photo(dynamic b, {double w = 52, double h = 52, IconData ic = Icons.directions_car}) {
+            if (b == null || b == '') {
+              return Container(width: w, height: h, decoration: BoxDecoration(color: const Color(0xFFE3E9F1), borderRadius: BorderRadius.circular(8)), child: Icon(ic, color: Colors.grey));
+            }
+            final bytes = _ic.putIfAbsent(b as String, () => base64Decode(b));
+            return ClipRRect(borderRadius: BorderRadius.circular(8), child: Image.memory(bytes, width: w, height: h, fit: BoxFit.cover, gaplessPlayback: true));
+          }
+          Widget chips(List<List<String>> o, String cur, void Function(String) f) => SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(children: [for (final x in o) Padding(padding: const EdgeInsets.only(right: 6), child: ChoiceChip(label: Text(x[1]), selected: x[0] == cur, onSelected: (_) => f(x[0])))]));
+          void sheet(BuildContext c, List<Widget> k) => showModalBottomSheet(
+              context: c, isScrollControlled: true,
+              builder: (_) => SafeArea(child: SingleChildScrollView(padding: const EdgeInsets.all(16), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: k))));
+          Widget empty() => const Padding(padding: EdgeInsets.all(24), child: Text('Nothing here yet. Add it from the Manage page.', style: TextStyle(color: Colors.grey)));
+
+          Widget tripCard(BuildContext c, M t) => card(
+              Row(children: [
+                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text('${find('cars', t['carId'])['reg'] ?? '—'}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  Text('${t['from']} → ${t['to']} · ${t['date']}', style: const TextStyle(color: Colors.grey, fontSize: 12)),
+                ])),
+                Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                  Text(money(inc(t)), style: const TextStyle(fontWeight: FontWeight.bold)),
+                  badge('${t['pay']}', t['pay'] == 'Paid' ? kGreen : t['pay'] == 'Unpaid' ? kRed : kAmber),
+                ]),
+              ]),
+              onTap: () => tripSheet(c, t));
+
+          void tripSheet(BuildContext c, M t) => sheet(c, [
+                Text('${find('cars', t['carId'])['reg'] ?? ''}', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                kv('Date', t['date']), kv('Customer', t['customer']), kv('Driver', find('drivers', t['driverId'])['name']),
+                kv('Route', '${t['from']} → ${t['to']}'), kv('Start KM', t['startKm']), kv('End KM', t['endKm']), kv('Distance', '${dist(t)} km'),
+                kv('Trip charge', money(t['charge'])), kv('Extra', money(t['extra'])), kv('Fuel/Toll/Parking', money(t['costs'])),
+                kv('Total income', money(inc(t))), kv('Payment', t['pay']), kv('Notes', t['notes']),
+                if ('${t['photoS'] ?? ''}'.isNotEmpty) ...[const Text('Start odometer'), photo(t['photoS'], w: double.infinity, h: 200)],
+                if ('${t['photoE'] ?? ''}'.isNotEmpty) ...[const SizedBox(height: 8), const Text('End odometer'), photo(t['photoE'], w: double.infinity, h: 200)],
+              ]);
+
+          void carSheet(BuildContext c, M x) {
+            final ts = L('trips').where((t) => t['carId'] == x['id']).cast<M>().toList();
+            num ex = ts.fold<num>(0, (s, t) => s + nn(t['costs']));
+            for (final e in L('expenses')) { if (e['carId'] == x['id']) ex += nn(e['amount']); }
+            final income = ts.fold<num>(0, (s, t) => s + inc(t));
+            sheet(c, [
+              if ('${x['photo'] ?? ''}'.isNotEmpty) photo(x['photo'], w: double.infinity, h: 200),
+              Text('${x['reg']}', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              Text('${x['name']}', style: const TextStyle(color: Colors.grey)),
+              kv('Status', x['status']), kv('Year', x['year']), kv('Fuel', x['fuel']), kv('Mileage', '${x['mileage'] ?? 0} km/l'),
+              kv('Odometer', '${x['odo'] ?? 0} km'), kv('Insurance', x['insurance']), kv('PUC', x['puc']), kv('Permit', x['permit']),
+              kv('Driver', find('drivers', x['driverId'])['name']),
+              kv('Total income', money(income)), kv('Total expenses', money(ex)), kv('Net', money(income - ex)),
+              kv('Km travelled', '${ts.fold<num>(0, (s, t) => s + dist(t))} km'),
+            ]);
+          }
+
+          // ---------- app ----------
+          void main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await loadDb();
+            runApp(MaterialApp(
+              title: 'Car Rental',
+              debugShowCheckedModeBanner: false,
+              theme: ThemeData(colorSchemeSeed: kBlue, useMaterial3: true, scaffoldBackgroundColor: const Color(0xFFF2F5F9), appBarTheme: const AppBarTheme(backgroundColor: kNavy, foregroundColor: Colors.white)),
+              home: const Shell(),
+            ));
+          }
+
+          class Shell extends StatefulWidget {
+            const Shell({super.key});
+            @override
+            State<Shell> createState() => _ShellS();
+          }
+          class _ShellS extends State<Shell> {
+            int i = 0;
+            void r() => setState(() {});
+            @override
+            Widget build(BuildContext c) {
+              const titles = ['Car Rental', 'My Fleet', 'Trips', 'Reports', 'Manage (Edit Everything)'];
+              final pages = <Widget Function()>[() => const HomePage(), () => const FleetPage(), () => const TripsPage(), () => const ReportsPage(), () => ManagePage(onChange: r)];
+              return Scaffold(
+                appBar: AppBar(title: Text(titles[i])),
+                body: pages[i](),
+                bottomNavigationBar: NavigationBar(selectedIndex: i, onDestinationSelected: (v) => setState(() => i = v), destinations: const [
+                  NavigationDestination(icon: Icon(Icons.home), label: 'Home'),
+                  NavigationDestination(icon: Icon(Icons.directions_car), label: 'Cars'),
+                  NavigationDestination(icon: Icon(Icons.receipt_long), label: 'Trips'),
+                  NavigationDestination(icon: Icon(Icons.bar_chart), label: 'Reports'),
+                  NavigationDestination(icon: Icon(Icons.settings), label: 'Manage'),
+                ]),
+              );
+            }
+          }
+
+          class HomePage extends StatelessWidget {
+            const HomePage({super.key});
+            @override
+            Widget build(BuildContext c) {
+              final td = L('trips').where((t) => t['date'] == today()).cast<M>().toList();
+              num te = td.fold<num>(0, (s, t) => s + nn(t['costs']));
+              for (final e in L('expenses')) { if (e['date'] == today()) te += nn(e['amount']); }
+              final st = stats(today().substring(0, 7));
+              final mx = <num>[st['i']!, st['e']!, 1].reduce((a, b) => a > b ? a : b);
+              final cars = L('cars');
+              Widget tile(String n, String l, Color col) => Expanded(child: Container(margin: const EdgeInsets.all(4), padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: col, borderRadius: BorderRadius.circular(12)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(n, style: const TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.bold)), Text(l, style: const TextStyle(color: Colors.white, fontSize: 12))])));
+              final recent = L('trips').cast<M>().toList()..sort((a, b) => '${b['date']}'.compareTo('${a['date']}'));
+              return ListView(padding: const EdgeInsets.all(8), children: [
+                Row(children: [tile('${cars.length}', 'Total Cars', kBlue), tile('${cars.where((x) => x['status'] == 'On Trip').length}', 'On Trip', kGreen), tile('${cars.where((x) => x['status'] == 'Available').length}', 'Available', Colors.blueGrey)]),
+                Row(children: [
+                  Expanded(child: card(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text("Today's Earnings"), Text(money(td.fold<num>(0, (s, t) => s + inc(t))), style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold))]))),
+                  const SizedBox(width: 8),
+                  Expanded(child: card(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text("Today's Expenses"), Text(money(te), style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold))]))),
+                ]),
+                card(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Text('This Month', style: TextStyle(fontWeight: FontWeight.bold)),
+                  bar('Income', st['i']!, mx, kGreen), bar('Expenses', st['e']!, mx, kRed), bar('Net', st['i']! - st['e']!, mx, kBlue),
+                ])),
+                card(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Text('Reminders', style: TextStyle(fontWeight: FontWeight.bold)),
+                  for (final r in rem().take(5)) Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: Row(children: [Expanded(child: Text('${r['t']} · ${r['c'] ?? ''}')), dueBadge(r['d'])])),
+                  if (rem().isEmpty) const Text('None', style: TextStyle(color: Colors.grey)),
+                ])),
+                const Padding(padding: EdgeInsets.all(6), child: Text('Recent Trips', style: TextStyle(fontWeight: FontWeight.bold))),
+                for (final t in recent.take(5)) tripCard(c, t),
+                if (recent.isEmpty) empty(),
+              ]);
+            }
+          }
+
+          class FleetPage extends StatefulWidget {
+            const FleetPage({super.key});
+            @override
+            State<FleetPage> createState() => _FleetS();
+          }
+          class _FleetS extends State<FleetPage> {
+            String sub = 'cars';
+            @override
+            Widget build(BuildContext c) {
+              final List<Widget> body = [];
+              if (sub == 'cars') {
+                for (final x in L('cars').cast<M>()) {
+                  body.add(card(Row(children: [
+                    photo(x['photo']), const SizedBox(width: 10),
+                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('${x['reg']}', style: const TextStyle(fontWeight: FontWeight.bold)), Text('${x['name']} · ${x['fuel']} · ${x['year'] ?? ''}', style: const TextStyle(color: Colors.grey, fontSize: 12))])),
+                    badge('${x['status']}', x['status'] == 'Available' ? kGreen : x['status'] == 'On Trip' ? kBlue : kAmber),
+                  ]), onTap: () => carSheet(c, x)));
+                }
+              } else if (sub == 'drivers') {
+                for (final d in L('drivers').cast<M>()) {
+                  final cr = L('cars').cast<M>().where((x) => x['driverId'] == d['id']);
+                  body.add(card(Row(children: [
+                    photo(d['photo'], ic: Icons.person), const SizedBox(width: 10),
+                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('${d['name']}', style: const TextStyle(fontWeight: FontWeight.bold)), Text('${d['phone'] ?? ''} · ${cr.isEmpty ? '' : cr.first['reg']}', style: const TextStyle(color: Colors.grey, fontSize: 12))])),
+                  ])));
+                }
+              } else {
+                for (final r in rem()) {
+                  body.add(card(Row(children: [
+                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('${r['t']}', style: const TextStyle(fontWeight: FontWeight.bold)), Text('${r['c'] ?? ''}${'${r['k'] ?? ''}'.isEmpty ? '' : ' · at ${r['k']} km'}', style: const TextStyle(color: Colors.grey, fontSize: 12))])),
+                    dueBadge(r['d']),
+                  ])));
+                }
+              }
+              return ListView(padding: const EdgeInsets.all(12), children: [
+                chips([['cars', 'Cars'], ['drivers', 'Drivers'], ['service', 'Service']], sub, (v) => setState(() => sub = v)),
+                const SizedBox(height: 10),
+                ...body,
+                if (body.isEmpty) empty(),
+              ]);
+            }
+          }
+
+          class TripsPage extends StatelessWidget {
+            const TripsPage({super.key});
+            @override
+            Widget build(BuildContext c) {
+              final l = L('trips').cast<M>().toList()..sort((a, b) => '${b['date']}'.compareTo('${a['date']}'));
+              return ListView(padding: const EdgeInsets.all(12), children: [for (final t in l) tripCard(c, t), if (l.isEmpty) empty()]);
+            }
+          }
+
+          class ReportsPage extends StatefulWidget {
+            const ReportsPage({super.key});
+            @override
+            State<ReportsPage> createState() => _RepS();
+          }
+          class _RepS extends State<ReportsPage> {
+            String mon = today().substring(0, 7);
+            void mm(int n) {
+              var y = int.parse(mon.substring(0, 4)), m = int.parse(mon.substring(5)) + n;
+              if (m < 1) { m = 12; y--; }
+              if (m > 12) { m = 1; y++; }
+              setState(() => mon = '$y-${m.toString().padLeft(2, '0')}');
+            }
+            @override
+            Widget build(BuildContext c) {
+              final s = stats(mon);
+              final mx = <num>[s['i']!, s['e']!, 1].reduce((a, b) => a > b ? a : b);
+              final per = L('cars').cast<M>().map((x) => MapEntry(x, stats(mon, x['id']))).toList();
+              final m2 = per.fold<num>(1, (a, p) => [a, p.value['i']!, p.value['e']!].reduce((u, v) => u > v ? u : v));
+              return ListView(padding: const EdgeInsets.all(12), 
+                        class FormPage extends StatefulWidget {
+            final String t;
+            final String? id;
+            const FormPage(this.t, this.id, {super.key});
+            @override
+            State<FormPage> createState() => _FormS();
+          }
+          class _FormS extends State<FormPage> {
+            late M o;
+            final ctl = <String, TextEditingController>{};
+
+            @override
+            void initState() {
+              super.initState();
+              o = widget.id == null ? <String, dynamic>{'id': uid()} : Map<String, dynamic>.from(find(widget.t, widget.id));
+              for (final f in F[widget.t]!) {
+                final k = f[0] as String, ty = f.length > 2 ? f[2] as String : 'text';
+                if (ty == 'select') {
+                  final op = f[3] as List;
+                  if (!op.contains(o[k])) o[k] = op.first;
+                } else if (ty == 'ref') {
+                  if (find(f[3] as String, o[k]).isEmpty) o[k] = null;
+                } else if (ty != 'img') {
+                  ctl[k] = TextEditingController(text: '${o[k] ?? (k == 'date' ? today() : '')}');
+                }
+              }
+            }
+
+            Future<void> pickImg(String k, ImageSource s) async {
+              final x = await ImagePicker().pickImage(source: s, maxWidth: 900, imageQuality: 70);
+              if (x == null) return;
+              final b = await x.readAsBytes();
+              setState(() => o[k] = base64Encode(b));
+            }
+
+            Future<void> save() async {
+              for (final f in F[widget.t]!) {
+                final k = f[0] as String, ty = f.length > 2 ? f[2] as String : 'text';
+                if (ctl.containsKey(k)) {
+                  final v = ctl[k]!.text.trim();
+                  o[k] = ty == 'number' ? (v.isEmpty ? '' : (num.tryParse(v) ?? '')) : v;
+                }
+              }
+              if (widget.t == 'trips') {
+                final cr = find('cars', o['carId']);
+                if (cr.isNotEmpty && nn(o['endKm']) > nn(cr['odo'])) cr['odo'] = nn(o['endKm']);
+              }
+              final l = L(widget.t);
+              final i = l.indexWhere((x) => x['id'] == o['id']);
+              if (i >= 0) { l[i] = o; } else { l.add(o); }
+              await saveDb();
+              if (mounted) Navigator.pop(context);
+            }
+
+            Widget field(BuildContext c, List f) {
+              final k = f[0] as String, lab = f[1] as String, ty = f.length > 2 ? f[2] as String : 'text';
+              final dec = InputDecoration(labelText: lab, border: const OutlineInputBorder());
+              Widget w;
+              if (ty == 'select') {
+                w = DropdownButtonFormField<String>(
+                    value: o[k] as String?, decoration: dec,
+                    items: [for (final x in f[3] as List) DropdownMenuItem<String>(value: '$x', child: Text('$x'))],
+                    onChanged: (v) => setState(() => o[k] = v));
+              } else if (ty == 'ref') {
+                w = DropdownButtonFormField<String?>(
+                    value: o[k] as String?, decoration: dec,
+                    items: [
+                      const DropdownMenuItem<String?>(value: null, child: Text('—')),
+                      for (final x in L(f[3] as String).cast<M>()) DropdownMenuItem<String?>(value: x['id'] as String, child: Text('${x['reg'] ?? x['name']}')),
+                    ],
+                    onChanged: (v) => setState(() => o[k] = v));
+              } else if (ty == 'date') {
+                w = TextField(
+                    controller: ctl[k], readOnly: true,
+                    decoration: InputDecoration(labelText: lab, border: const OutlineInputBorder(), suffixIcon: IconButton(icon: const Icon(Icons.clear), onPressed: () => ctl[k]!.clear())),
+                    onTap: () async {
+                      final d = await showDatePicker(context: c, initialDate: DateTime.tryParse(ctl[k]!.text) ?? DateTime.now(), firstDate: DateTime(2015), lastDate: DateTime(2100));
+                      if (d != null) ctl[k]!.text = d.toIso8601String().substring(0, 10);
+                    });
+              } else if (ty == 'img') {
+                final has = '${o[k] ?? ''}'.isNotEmpty;
+                w = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(lab, style: const TextStyle(color: Colors.grey)),
+                  const SizedBox(height: 6),
+                  if (has) ...[photo(o[k], w: double.infinity, h: 180), const SizedBox(height: 6)],
+                  Wrap(spacing: 8, children: [
+                    OutlinedButton.icon(onPressed: () => pickImg(k, ImageSource.camera), icon: const Icon(Icons.photo_camera), label: const Text('Camera')),
+                    OutlinedButton.icon(onPressed: () => pickImg(k, ImageSource.gallery), icon: const Icon(Icons.photo_library), label: const Text('Gallery')),
+                    if (has) TextButton(onPressed: () => setState(() => o[k] = ''), child: const Text('Remove')),
+                  ]),
+                ]);
+              } else {
+                w = TextField(
+                    controller: ctl[k], decoration: dec,
+                    keyboardType: ty == 'number' ? const TextInputType.numberWithOptions(decimal: true) : ty == 'tel' ? TextInputType.phone : TextInputType.text);
+              }
+              return Padding(padding: const EdgeInsets.only(top: 12), child: w);
+            }
+
+            @override
+            Widget build(BuildContext c) => Scaffold(
+                  appBar: AppBar(title: Text('${widget.id == null ? 'Add' : 'Edit'} ${widget.t}'), actions: [TextButton(onPressed: save, child: const Text('SAVE', style: TextStyle(color: Colors.white)))]),
+                  body: ListView(padding: const EdgeInsets.all(16), children: [
+                    for (final f in F[widget.t]!) field(c, f),
+                    const SizedBox(height: 16),
+                    FilledButton(onPressed: save, child: const Text('Save')),
+                    const SizedBox(height: 30),
+                  ]),
+                );
+          }
+          DARTEOF
+
+      - name: App name and camera permission
+        run: |
+          M=app/android/app/src/main/AndroidManifest.xml
+          sed -i 's#android:label="car_rental"#android:label="Car Rental"#' $M
+          sed -i 's#<application#<uses-permission android:name="android.permission.CAMERA"/>\n    <application#' $M
+
+      - name: Build APK
+        working-directory: app
+        run: |
+          flutter pub add path_provider image_picker share_plus:^7.2.2 file_picker:^8.1.2
+          flutter build apk --release
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarRental-APK
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: app/build/app/outputs/flutter-apk/app-release.apk
+                    class FormPage extends StatefulWidget {
+            final String t;
+            final String? id;
+            const FormPage(this.t, this.id, {super.key});
+            @override
+            State<FormPage> createState() => _FormS();
+          }
+          class _FormS extends State<FormPage> {
+            late M o;
+            final ctl = <String, TextEditingController>{};
+
+            @override
+            void initState() {
+              super.initState();
+              o = widget.id == null ? <String, dynamic>{'id': uid()} : Map<String, dynamic>.from(find(widget.t, widget.id));
+              for (final f in F[widget.t]!) {
+                final k = f[0] as String, ty = f.length > 2 ? f[2] as String : 'text';
+                if (ty == 'select') {
+                  final op = f[3] as List;
+                  if (!op.contains(o[k])) o[k] = op.first;
+                } else if (ty == 'ref') {
+                  if (find(f[3] as String, o[k]).isEmpty) o[k] = null;
+                } else if (ty != 'img') {
+                  ctl[k] = TextEditingController(text: '${o[k] ?? (k == 'date' ? today() : '')}');
+                }
+              }
+            }
+
+            Future<void> pickImg(String k, ImageSource s) async {
+              final x = await ImagePicker().pickImage(source: s, maxWidth: 900, imageQuality: 70);
+              if (x == null) return;
+              final b = await x.readAsBytes();
+              setState(() => o[k] = base64Encode(b));
+            }
+
+            Future<void> save() async {
+              for (final f in F[widget.t]!) {
+                final k = f[0] as String, ty = f.length > 2 ? f[2] as String : 'text';
+                if (ctl.containsKey(k)) {
+                  final v = ctl[k]!.text.trim();
+                  o[k] = ty == 'number' ? (v.isEmpty ? '' : (num.tryParse(v) ?? '')) : v;
+                }
+              }
+              if (widget.t == 'trips') {
+                final cr = find('cars', o['carId']);
+                if (cr.isNotEmpty && nn(o['endKm']) > nn(cr['odo'])) cr['odo'] = nn(o['endKm']);
+              }
+              final l = L(widget.t);
+              final i = l.indexWhere((x) => x['id'] == o['id']);
+              if (i >= 0) { l[i] = o; } else { l.add(o); }
+              await saveDb();
+              if (mounted) Navigator.pop(context);
+            }
+
+            Widget field(BuildContext c, List f) {
+              final k = f[0] as String, lab = f[1] as String, ty = f.length > 2 ? f[2] as String : 'text';
+              final dec = InputDecoration(labelText: lab, border: const OutlineInputBorder());
+              Widget w;
+              if (ty == 'select') {
+                w = DropdownButtonFormField<String>(
+                    value: o[k] as String?, decoration: dec,
+                    items: [for (final x in f[3] as List) DropdownMenuItem<String>(value: '$x', child: Text('$x'))],
+                    onChanged: (v) => setState(() => o[k] = v));
+              } else if (ty == 'ref') {
+                w = DropdownButtonFormField<String?>(
+                    value: o[k] as String?, decoration: dec,
+                    items: [
+                      const DropdownMenuItem<String?>(value: null, child: Text('—')),
+                      for (final x in L(f[3] as String).cast<M>()) DropdownMenuItem<String?>(value: x['id'] as String, child: Text('${x['reg'] ?? x['name']}')),
+                    ],
+                    onChanged: (v) => setState(() => o[k] = v));
+              } else if (ty == 'date') {
+                w = TextField(
+                    controller: ctl[k], readOnly: true,
+                    decoration: InputDecoration(labelText: lab, border: const OutlineInputBorder(), suffixIcon: IconButton(icon: const Icon(Icons.clear), onPressed: () => ctl[k]!.clear())),
+                    onTap: () async {
+                      final d = await showDatePicker(context: c, initialDate: DateTime.tryParse(ctl[k]!.text) ?? DateTime.now(), firstDate: DateTime(2015), lastDate: DateTime(2100));
+                      if (d != null) ctl[k]!.text = d.toIso8601String().substring(0, 10);
+                    });
+              } else if (ty == 'img') {
+                final has = '${o[k] ?? ''}'.isNotEmpty;
+                w = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(lab, style: const TextStyle(color: Colors.grey)),
+                  const SizedBox(height: 6),
+                  if (has) ...[photo(o[k], w: double.infinity, h: 180), const SizedBox(height: 6)],
+                  Wrap(spacing: 8, children: [
+                    OutlinedButton.icon(onPressed: () => pickImg(k, ImageSource.camera), icon: const Icon(Icons.photo_camera), label: const Text('Camera')),
+                    OutlinedButton.icon(onPressed: () => pickImg(k, ImageSource.gallery), icon: const Icon(Icons.photo_library), label: const Text('Gallery')),
+                    if (has) TextButton(onPressed: () => setState(() => o[k] = ''), child: const Text('Remove')),
+                  ]),
+                ]);
+              } else {
+                w = TextField(
+                    controller: ctl[k], decoration: dec,
+                    keyboardType: ty == 'number' ? const TextInputType.numberWithOptions(decimal: true) : ty == 'tel' ? TextInputType.phone : TextInputType.text);
+              }
+              return Padding(padding: const EdgeInsets.only(top: 12), child: w);
+            }
+
+            @override
+            Widget build(BuildContext c) => Scaffold(
+                  appBar: AppBar(title: Text('${widget.id == null ? 'Add' : 'Edit'} ${widget.t}'), actions: [TextButton(onPressed: save, child: const Text('SAVE', style: TextStyle(color: Colors.white)))]),
+                  body: ListView(padding: const EdgeInsets.all(16), children: [
+                    for (final f in F[widget.t]!) field(c, f),
+                    const SizedBox(height: 16),
+                    FilledButton(onPressed: save, child: const Text('Save')),
+                    const SizedBox(height: 30),
+                  ]),
+                );
+          }
+          DARTEOF
+
+      - name: App name and camera permission
+        run: |
+          M=app/android/app/src/main/AndroidManifest.xml
+          sed -i 's#android:label="car_rental"#android:label="Car Rental"#' $M
+          sed -i 's#<application#<uses-permission android:name="android.permission.CAMERA"/>\n    <application#' $M
+
+      - name: Build APK
+        working-directory: app
+        run: |
+          flutter pub add path_provider image_picker share_plus:^7.2.2 file_picker:^8.1.2
+          flutter build apk --release
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarRental-APK
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: app/build/app/outputs/flutter-apk/app-release.apk
+          
