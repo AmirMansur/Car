@@ -325,144 +325,172 @@ jobs:
               final mx = <num>[s['i']!, s['e']!, 1].reduce((a, b) => a > b ? a : b);
               final per = L('cars').cast<M>().map((x) => MapEntry(x, stats(mon, x['id']))).toList();
               final m2 = per.fold<num>(1, (a, p) => [a, p.value['i']!, p.value['e']!].reduce((u, v) => u > v ? u : v));
-              return ListView(padding: const EdgeInsets.all(12), 
-                        class FormPage extends StatefulWidget {
-            final String t;
-            final String? id;
-            const FormPage(this.t, this.id, {super.key});
-            @override
-            State<FormPage> createState() => _FormS();
+              return ListView(padding: const EdgeInsets.all(12), children: [
+                Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [IconButton(onPressed: () => mm(-1), icon: const Icon(Icons.chevron_left)), Text(mon, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)), IconButton(onPressed: () => mm(1), icon: const Icon(Icons.chevron_right))]),
+                card(Column(children: [bar('Income', s['i']!, mx, kGreen), bar('Expenses', s['e']!, mx, kRed), bar('Net', s['i']! - s['e']!, mx, kBlue), kv('Total km', '${s['k']} km')])),
+                const Padding(padding: EdgeInsets.all(6), child: Text('Car wise', style: TextStyle(fontWeight: FontWeight.bold))),
+                for (final p in per) card(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('${p.key['reg']}  ·  ${p.value['k']} km', style: const TextStyle(fontWeight: FontWeight.bold)), bar('Income', p.value['i']!, m2, kGreen), bar('Expenses', p.value['e']!, m2, kRed)])),
+              ]);
+            }
           }
-          class _FormS extends State<FormPage> {
-            late M o;
-            final ctl = <String, TextEditingController>{};
 
+          // ---------- manage (the ONLY place to add / edit / delete / upload photos) ----------
+          final Map<String, List<List<dynamic>>> F = {
+            'cars': [
+              ['reg', 'Registration no.'], ['name', 'Car name / model'], ['year', 'Year', 'number'],
+              ['fuel', 'Fuel', 'select', ['Petrol', 'Diesel', 'CNG']], ['mileage', 'Mileage (km/l)', 'number'],
+              ['odo', 'Current odometer (km)', 'number'], ['status', 'Status', 'select', ['Available', 'On Trip', 'Service']],
+              ['insurance', 'Insurance expiry', 'date'], ['puc', 'PUC expiry', 'date'], ['permit', 'Permit expiry', 'date'],
+              ['driverId', 'Assigned driver', 'ref', 'drivers'], ['photo', 'Car photo', 'img'],
+            ],
+            'drivers': [['name', 'Name'], ['phone', 'Phone', 'tel'], ['licence', 'Licence no.'], ['photo', 'Driver photo', 'img']],
+            'trips': [
+              ['carId', 'Car', 'ref', 'cars'], ['driverId', 'Driver', 'ref', 'drivers'], ['customer', 'Customer name'], ['date', 'Date', 'date'],
+              ['from', 'Pickup'], ['to', 'Drop'], ['startKm', 'Starting KM', 'number'], ['endKm', 'Ending KM', 'number'],
+              ['charge', 'Trip charge (₹)', 'number'], ['extra', 'Extra charges (₹)', 'number'], ['costs', 'Fuel / Toll / Parking (₹)', 'number'],
+              ['pay', 'Payment status', 'select', ['Paid', 'Partially Paid', 'Unpaid']], ['notes', 'Notes'],
+              ['photoS', 'Start odometer photo', 'img'], ['photoE', 'End odometer photo', 'img'],
+            ],
+            'expenses': [
+              ['carId', 'Car', 'ref', 'cars'], ['type', 'Type', 'select', ['Fuel', 'Service', 'Repair', 'Toll/Parking', 'Insurance', 'Other']],
+              ['amount', 'Amount (₹)', 'number'], ['date', 'Date', 'date'], ['notes', 'Notes'],
+            ],
+            'maint': [
+              ['carId', 'Car', 'ref', 'cars'], ['title', 'What (e.g. Engine oil change)'], ['dueDate', 'Due date', 'date'],
+              ['dueKm', 'Due at km', 'number'], ['done', 'Completed?', 'select', ['No', 'Yes']],
+            ],
+          };
+
+          List<String> lbl(String t, M x) {
+            final cr = '${find('cars', x['carId'])['reg'] ?? ''}';
+            switch (t) {
+              case 'cars': return ['${x['reg']}', '${x['name'] ?? ''}'];
+              case 'drivers': return ['${x['name']}', '${x['phone'] ?? ''}'];
+              case 'trips': return ['$cr · ${money(inc(x))}', '${x['date']} · ${x['customer'] ?? ''}'];
+              case 'expenses': return ['$cr · ${x['type']} · ${money(x['amount'])}', '${x['date']}'];
+              default: return ['${x['title']} ($cr)', '${x['dueDate'] ?? ''} ${x['done'] == 'Yes' ? '✔ done' : ''}'];
+            }
+          }
+          void snack(BuildContext c, String m) => ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(m)));
+          Future<bool> ask(BuildContext c, String m) async => (await showDialog<bool>(
+                  context: c,
+                  builder: (d) => AlertDialog(content: Text(m), actions: [
+                        TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('Cancel')),
+                        TextButton(onPressed: () => Navigator.pop(d, true), child: const Text('Yes')),
+                      ]))) == true;
+
+          bool _unlocked = false;
+
+          class ManagePage extends StatefulWidget {
+            final VoidCallback onChange;
+            const ManagePage({super.key, required this.onChange});
             @override
-            void initState() {
-              super.initState();
-              o = widget.id == null ? <String, dynamic>{'id': uid()} : Map<String, dynamic>.from(find(widget.t, widget.id));
-              for (final f in F[widget.t]!) {
-                final k = f[0] as String, ty = f.length > 2 ? f[2] as String : 'text';
-                if (ty == 'select') {
-                  final op = f[3] as List;
-                  if (!op.contains(o[k])) o[k] = op.first;
-                } else if (ty == 'ref') {
-                  if (find(f[3] as String, o[k]).isEmpty) o[k] = null;
-                } else if (ty != 'img') {
-                  ctl[k] = TextEditingController(text: '${o[k] ?? (k == 'date' ? today() : '')}');
-                }
-              }
-            }
+            State<ManagePage> createState() => _ManS();
+          }
+          class _ManS extends State<ManagePage> {
+            String mt = 'cars';
+            final pin = TextEditingController(), np = TextEditingController();
 
-            Future<void> pickImg(String k, ImageSource s) async {
-              final x = await ImagePicker().pickImage(source: s, maxWidth: 900, imageQuality: 70);
-              if (x == null) return;
-              final b = await x.readAsBytes();
-              setState(() => o[k] = base64Encode(b));
+            Future<void> open(BuildContext c, String t, String? id) async {
+              await Navigator.push(c, MaterialPageRoute(builder: (_) => FormPage(t, id)));
+              if (!mounted) return;
+              setState(() {});
+              widget.onChange();
             }
-
-            Future<void> save() async {
-              for (final f in F[widget.t]!) {
-                final k = f[0] as String, ty = f.length > 2 ? f[2] as String : 'text';
-                if (ctl.containsKey(k)) {
-                  final v = ctl[k]!.text.trim();
-                  o[k] = ty == 'number' ? (v.isEmpty ? '' : (num.tryParse(v) ?? '')) : v;
-                }
-              }
-              if (widget.t == 'trips') {
-                final cr = find('cars', o['carId']);
-                if (cr.isNotEmpty && nn(o['endKm']) > nn(cr['odo'])) cr['odo'] = nn(o['endKm']);
-              }
-              final l = L(widget.t);
-              final i = l.indexWhere((x) => x['id'] == o['id']);
-              if (i >= 0) { l[i] = o; } else { l.add(o); }
+            Future<void> del(BuildContext c, M x) async {
+              if (!await ask(c, 'Delete this record?')) return;
+              L(mt).removeWhere((e) => e['id'] == x['id']);
               await saveDb();
-              if (mounted) Navigator.pop(context);
+              if (!mounted) return;
+              setState(() {});
+              widget.onChange();
+            }
+            Future<void> exportDb() async {
+              final d = await getTemporaryDirectory();
+              final f = File('${d.path}/fleet-backup-${today()}.json');
+              await f.writeAsString(jsonEncode(S));
+              await Share.shareXFiles([XFile(f.path)], text: 'Car Rental backup');
+            }
+            Future<void> restore(BuildContext c) async {
+              final r = await FilePicker.platform.pickFiles();
+              final p = r?.files.single.path;
+              if (p == null) return;
+              try {
+                final d = jsonDecode(await File(p).readAsString()) as M;
+                S = {...emptyDb(), ...d};
+                _ic.clear();
+                await saveDb();
+                if (!mounted) return;
+                setState(() {});
+                widget.onChange();
+                snack(context, 'Backup restored');
+              } catch (_) {
+                if (mounted) snack(context, 'Invalid backup file');
+              }
+            }
+            Future<void> wipe(BuildContext c) async {
+              if (!await ask(c, 'Erase ALL data? This cannot be undone.')) return;
+              S = emptyDb();
+              _ic.clear();
+              await saveDb();
+              if (!mounted) return;
+              setState(() {});
+              widget.onChange();
             }
 
-            Widget field(BuildContext c, List f) {
-              final k = f[0] as String, lab = f[1] as String, ty = f.length > 2 ? f[2] as String : 'text';
-              final dec = InputDecoration(labelText: lab, border: const OutlineInputBorder());
-              Widget w;
-              if (ty == 'select') {
-                w = DropdownButtonFormField<String>(
-                    value: o[k] as String?, decoration: dec,
-                    items: [for (final x in f[3] as List) DropdownMenuItem<String>(value: '$x', child: Text('$x'))],
-                    onChanged: (v) => setState(() => o[k] = v));
-              } else if (ty == 'ref') {
-                w = DropdownButtonFormField<String?>(
-                    value: o[k] as String?, decoration: dec,
-                    items: [
-                      const DropdownMenuItem<String?>(value: null, child: Text('—')),
-                      for (final x in L(f[3] as String).cast<M>()) DropdownMenuItem<String?>(value: x['id'] as String, child: Text('${x['reg'] ?? x['name']}')),
-                    ],
-                    onChanged: (v) => setState(() => o[k] = v));
-              } else if (ty == 'date') {
-                w = TextField(
-                    controller: ctl[k], readOnly: true,
-                    decoration: InputDecoration(labelText: lab, border: const OutlineInputBorder(), suffixIcon: IconButton(icon: const Icon(Icons.clear), onPressed: () => ctl[k]!.clear())),
-                    onTap: () async {
-                      final d = await showDatePicker(context: c, initialDate: DateTime.tryParse(ctl[k]!.text) ?? DateTime.now(), firstDate: DateTime(2015), lastDate: DateTime(2100));
-                      if (d != null) ctl[k]!.text = d.toIso8601String().substring(0, 10);
-                    });
-              } else if (ty == 'img') {
-                final has = '${o[k] ?? ''}'.isNotEmpty;
-                w = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(lab, style: const TextStyle(color: Colors.grey)),
-                  const SizedBox(height: 6),
-                  if (has) ...[photo(o[k], w: double.infinity, h: 180), const SizedBox(height: 6)],
-                  Wrap(spacing: 8, children: [
-                    OutlinedButton.icon(onPressed: () => pickImg(k, ImageSource.camera), icon: const Icon(Icons.photo_camera), label: const Text('Camera')),
-                    OutlinedButton.icon(onPressed: () => pickImg(k, ImageSource.gallery), icon: const Icon(Icons.photo_library), label: const Text('Gallery')),
-                    if (has) TextButton(onPressed: () => setState(() => o[k] = ''), child: const Text('Remove')),
-                  ]),
-                ]);
-              } else {
-                w = TextField(
-                    controller: ctl[k], decoration: dec,
-                    keyboardType: ty == 'number' ? const TextInputType.numberWithOptions(decimal: true) : ty == 'tel' ? TextInputType.phone : TextInputType.text);
-              }
-              return Padding(padding: const EdgeInsets.only(top: 12), child: w);
+            Widget item(BuildContext c, M x) {
+              final l = lbl(mt, x);
+              return card(Row(children: [
+                if (mt == 'cars' || mt == 'drivers') ...[photo(x['photo'], ic: mt == 'cars' ? Icons.directions_car : Icons.person), const SizedBox(width: 10)],
+                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(l[0], style: const TextStyle(fontWeight: FontWeight.bold)), Text(l[1], style: const TextStyle(color: Colors.grey, fontSize: 12))])),
+                IconButton(onPressed: () => open(c, mt, x['id'] as String), icon: const Icon(Icons.edit)),
+                IconButton(onPressed: () => del(c, x), icon: const Icon(Icons.delete, color: kRed)),
+              ]));
             }
+
+            List<Widget> settings(BuildContext c) => [
+                  card(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('PIN lock for this page', style: TextStyle(fontWeight: FontWeight.bold)),
+                    TextField(controller: np, obscureText: true, keyboardType: TextInputType.number, decoration: const InputDecoration(hintText: 'New PIN (empty = no PIN)')),
+                    const SizedBox(height: 8),
+                    FilledButton(onPressed: () async { S['pin'] = np.text; await saveDb(); np.clear(); if (mounted) snack(context, S['pin'] == '' ? 'PIN removed' : 'PIN saved'); }, child: const Text('Save PIN')),
+                  ])),
+                  card(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('Backup', style: TextStyle(fontWeight: FontWeight.bold)),
+                    const Text('Includes photos. Send the file to yourself on WhatsApp or Google Drive.', style: TextStyle(color: Colors.grey)),
+                    const SizedBox(height: 8),
+                    Wrap(spacing: 8, children: [FilledButton(onPressed: exportDb, child: const Text('Export backup')), OutlinedButton(onPressed: () => restore(c), child: const Text('Restore backup'))]),
+                  ])),
+                  card(FilledButton(style: FilledButton.styleFrom(backgroundColor: kRed), onPressed: () => wipe(c), child: const Text('Erase all data'))),
+                ];
 
             @override
-            Widget build(BuildContext c) => Scaffold(
-                  appBar: AppBar(title: Text('${widget.id == null ? 'Add' : 'Edit'} ${widget.t}'), actions: [TextButton(onPressed: save, child: const Text('SAVE', style: TextStyle(color: Colors.white)))]),
-                  body: ListView(padding: const EdgeInsets.all(16), children: [
-                    for (final f in F[widget.t]!) field(c, f),
-                    const SizedBox(height: 16),
-                    FilledButton(onPressed: save, child: const Text('Save')),
-                    const SizedBox(height: 30),
-                  ]),
-                );
+            Widget build(BuildContext c) {
+              if ('${S['pin']}'.isNotEmpty && !_unlocked) {
+                return ListView(padding: const EdgeInsets.all(12), children: [
+                  card(Column(children: [
+                    const Text('Enter PIN', style: TextStyle(fontWeight: FontWeight.bold)),
+                    TextField(controller: pin, obscureText: true, keyboardType: TextInputType.number),
+                    const SizedBox(height: 8),
+                    FilledButton(onPressed: () { if (pin.text == S['pin']) { pin.clear(); setState(() => _unlocked = true); } else { snack(c, 'Wrong PIN'); } }, child: const Text('Unlock')),
+                  ])),
+                ]);
+              }
+              final tabs = [['cars', 'Cars'], ['drivers', 'Drivers'], ['trips', 'Trips'], ['expenses', 'Expenses'], ['maint', 'Service'], ['set', 'Settings']];
+              return ListView(padding: const EdgeInsets.all(12), children: [
+                chips(tabs, mt, (v) => setState(() => mt = v)),
+                const SizedBox(height: 10),
+                if (mt == 'set') ...settings(c) else ...[
+                  FilledButton.icon(onPressed: () => open(c, mt, null), icon: const Icon(Icons.add), label: const Text('Add new')),
+                  const SizedBox(height: 10),
+                  for (final x in L(mt).reversed.cast<M>()) item(c, x),
+                  if (L(mt).isEmpty) empty(),
+                ],
+              ]);
+            }
           }
-          DARTEOF
 
-      - name: App name and camera permission
-        run: |
-          M=app/android/app/src/main/AndroidManifest.xml
-          sed -i 's#android:label="car_rental"#android:label="Car Rental"#' $M
-          sed -i 's#<application#<uses-permission android:name="android.permission.CAMERA"/>\n    <application#' $M
-
-      - name: Build APK
-        working-directory: app
-        run: |
-          flutter pub add path_provider image_picker share_plus:^7.2.2 file_picker:^8.1.2
-          flutter build apk --release
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: CarRental-APK
-          path: app/build/app/outputs/flutter-apk/app-release.apk
-
-      - name: Publish to Releases
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: Build ${{ github.run_number }}
-          files: app/build/app/outputs/flutter-apk/app-release.apk
-                    class FormPage extends StatefulWidget {
+          class FormPage extends StatefulWidget {
             final String t;
             final String? id;
             const FormPage(this.t, this.id, {super.key});
